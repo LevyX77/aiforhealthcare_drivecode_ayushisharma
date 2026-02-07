@@ -1,7 +1,6 @@
 import os
 import glob
 import pandas as pd
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -11,90 +10,130 @@ from sklearn.metrics import classification_report
 import monai
 from monai.transforms import Compose, LoadImaged, EnsureChannelFirstd, RandRotate90d, RandFlipd, ScaleIntensityd
 
-# --- CONFIGURATION EXPERT ---
+# --- CONFIGURATION ---
 HOME = os.path.expanduser("~")
 DATA_DIR = os.path.join(HOME, "Alzheimer_Project", "data", "final")
 CSV_PATH = os.path.join(HOME, "Alzheimer_Project", "data", "metadata.csv")
 MODEL_SAVE_PATH = os.path.join(HOME, "Alzheimer_Project", "models", "alzheimer_cnn.pth")
-EPOCHS = 20 # Nombre de fois où l'IA voit tout le dataset
-BATCH_SIZE = 4 # Petit batch car les images 3D prennent beaucoup de VRAM
-LR = 0.0001 # Learning Rate doux pour apprendre finement
 
-# --- 1. LE MODÈLE (Architecture CNN 3D Optimisée) ---
-class ExpertAlzheimer3D(nn.Module):
+# Training Settings
+EPOCHS = 25
+BATCH_SIZE = 4
+LR = 0.0001
+
+# --- 1. DATASET CLASS ---
+class ADNI_Dataset(Dataset):
+    def __init__(self, files, labels, transform=None):
+        self.files = files
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        img_path = self.files[idx]
+        label = self.labels[idx]
+        
+        data = {"image": img_path}
+        
+        if self.transform:
+            data = self.transform(data)
+        
+        return data["image"], torch.tensor(label, dtype=torch.long)
+
+# --- 2. 3D CNN MODEL ---
+class AlzheimerNet(nn.Module):
     def __init__(self):
-        super(ExpertAlzheimer3D, self).__init__()
-        # Block 1
-        self.conv1 = nn.Conv3d(1, 16, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm3d(16)
-        self.pool1 = nn.MaxPool3d(2) # 96 -> 48
+        super(AlzheimerNet, self).__init__()
         
-        # Block 2
-        self.conv2 = nn.Conv3d(16, 32, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm3d(32)
-        self.pool2 = nn.MaxPool3d(2) # 48 -> 24
+        # Feature Extraction (Convolutional Layers)
+        self.features = nn.Sequential(
+            # Block 1
+            nn.Conv3d(1, 16, kernel_size=3, padding=1),
+            nn.BatchNorm3d(16),
+            nn.ReLU(),
+            nn.MaxPool3d(2),
+            
+            # Block 2
+            nn.Conv3d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm3d(32),
+            nn.ReLU(),
+            nn.MaxPool3d(2),
+            
+            # Block 3
+            nn.Conv3d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm3d(64),
+            nn.ReLU(),
+            nn.MaxPool3d(2),
+            
+            # Block 4
+            nn.Conv3d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm3d(128),
+            nn.ReLU(),
+            nn.MaxPool3d(2)
+        )
         
-        # Block 3
-        self.conv3 = nn.Conv3d(32, 64, kernel_size=3, padding=1)
-        self.bn3 = nn.BatchNorm3d(64)
-        self.pool3 = nn.MaxPool3d(2) # 24 -> 12
-        
-        # Block 4
-        self.conv4 = nn.Conv3d(64, 128, kernel_size=3, padding=1)
-        self.bn4 = nn.BatchNorm3d(128)
-        self.pool4 = nn.MaxPool3d(2) # 12 -> 6
-        
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(0.5) # Anti-overfitting crucial
-        
-        # Classifier
-        self.fc1 = nn.Linear(128 * 6 * 6 * 6, 512)
-        self.fc2 = nn.Linear(512, 2) # 2 Classes: CN (0) vs AD (1)
+        # Classification Layers
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(0.5),
+            nn.Linear(128 * 6 * 6 * 6, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 2) # 0 for CN, 1 for AD
+        )
 
     def forward(self, x):
-        x = self.pool1(self.relu(self.bn1(self.conv1(x))))
-        x = self.pool2(self.relu(self.bn2(self.conv2(x))))
-        x = self.pool3(self.relu(self.bn3(self.conv3(x))))
-        x = self.pool4(self.relu(self.bn4(self.conv4(x))))
-        
-        x = x.view(x.size(0), -1) # Flatten
-        x = self.dropout(self.relu(self.fc1(x)))
-        x = self.fc2(x)
+        x = self.features(x)
+        x = self.classifier(x)
         return x
 
-# --- 2. GESTION DES DONNÉES ---
-def get_data_loaders():
-    # A. Récupérer les labels du CSV
+# --- 3. DATA PREPARATION ---
+def prepare_data():
+    print("Loading Data...")
+    
+    # Read CSV
     df = pd.read_csv(CSV_PATH)
-    label_map = dict(zip(df['ImageID'], df['Group']))
+    id_to_group = dict(zip(df['ImageID'], df['Group']))
     
-    # B. Lister les fichiers disponibles
-    files = glob.glob(os.path.join(DATA_DIR, "*.nii.gz"))
-    data_list = []
-    labels_list = []
+    # List files
+    all_files = glob.glob(os.path.join(DATA_DIR, "*.nii.gz"))
     
-    print(f"🔍 Scan des fichiers dans {DATA_DIR}...")
-    for f in files:
-        img_id = os.path.basename(f).replace(".nii.gz", "")
-        if img_id in label_map:
-            group = label_map[img_id]
-            if group in ['CN', 'AD']:
-                data_list.append({"image": f})
-                # AD = 1, CN = 0
-                labels_list.append(1 if group == 'AD' else 0)
+    valid_files = []
+    valid_labels = []
     
-    print(f"📊 Dataset Final: {len(data_list)} images (CN/AD)")
+    for f in all_files:
+        filename = os.path.basename(f)
+        img_id = filename.replace(".nii.gz", "")
+        
+        if img_id in id_to_group:
+            group = id_to_group[img_id]
+            if group == 'CN':
+                valid_files.append(f)
+                valid_labels.append(0) # 0 = Normal
+            elif group == 'AD':
+                valid_files.append(f)
+                valid_labels.append(1) # 1 = Alzheimer
+
+    print(f"Found {len(valid_files)} images (CN: {valid_labels.count(0)}, AD: {valid_labels.count(1)})")
     
-    # C. Split Train / Val (80% / 20%)
-    X_train, X_val, y_train, y_val = train_test_split(data_list, labels_list, test_size=0.2, random_state=42, stratify=labels_list)
+    return train_test_split(valid_files, valid_labels, test_size=0.2, random_state=42, stratify=valid_labels)
+
+# --- 4. TRAINING LOOP ---
+def train():
+    if not os.path.exists(os.path.dirname(MODEL_SAVE_PATH)):
+        os.makedirs(os.path.dirname(MODEL_SAVE_PATH))
+
+    X_train, X_val, y_train, y_val = prepare_data()
     
-    # D. Augmentation de données (Pour éviter le par-cœur)
+    # Data Augmentation (MONAI)
     train_transforms = Compose([
         LoadImaged(keys=["image"]),
         EnsureChannelFirstd(keys=["image"]),
         ScaleIntensityd(keys=["image"]),
-        RandRotate90d(keys=["image"], prob=0.5, spatial_axes=(0, 2)), # Rotation aléatoire
-        RandFlipd(keys=["image"], prob=0.5, spatial_axis=0), # Miroir aléatoire
+        RandRotate90d(keys=["image"], prob=0.5, spatial_axes=(0, 2)),
+        RandFlipd(keys=["image"], prob=0.5, spatial_axis=0),
     ])
     
     val_transforms = Compose([
@@ -103,56 +142,66 @@ def get_data_loaders():
         ScaleIntensityd(keys=["image"])
     ])
 
-    # Création des Datasets MONAI
-    train_ds = monai.data.Dataset(data=X_train, transform=train_transforms)
-    val_ds = monai.data.Dataset(data=X_val, transform=val_transforms)
-
-    # Création des DataLoaders (Chargement parallèle)
+    # Loaders
+    train_ds = ADNI_Dataset(X_train, y_train, transform=train_transforms)
+    val_ds = ADNI_Dataset(X_val, y_val, transform=val_transforms)
+    
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
-    
-    return train_loader, val_loader, y_train, y_val
 
-# --- 3. ENTRAÎNEMENT ---
-def train():
-    if not os.path.exists(os.path.dirname(MODEL_SAVE_PATH)):
-        os.makedirs(os.path.dirname(MODEL_SAVE_PATH))
-
+    # Initialize Model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🔥 Démarrage sur : {device}")
+    print(f"Starting training on: {device}")
     
-    try:
-        train_loader, val_loader, _, _ = get_data_loaders()
-    except ValueError:
-        print("❌ Erreur : Pas assez d'images trouvées. Attends la fin du script 'prepare_dataset.py' !")
-        return
-
-    model = ExpertAlzheimer3D().to(device)
+    model = AlzheimerNet().to(device)
     optimizer = optim.Adam(model.parameters(), lr=LR)
-    criterion = nn.CrossEntropyLoss() # Poids pour déséquilibre de classes possible ici
-
-    print("🚀 Start Training...")
+    criterion = nn.CrossEntropyLoss()
     
+    print("Training Started...")
+
     for epoch in range(EPOCHS):
         model.train()
         running_loss = 0.0
         correct = 0
         total = 0
         
-        for batch in train_loader:
-            inputs = batch["image"].to(device)
-            # Les labels doivent être un tenseur simple
-            # Astuce: on récupère les labels depuis le filename ou le loader, 
-            # mais ici on doit ruser car monai Dataset dict ne porte pas le label par défaut.
-            # SIMPLIFICATION EXPERTE : On va recréer le label à la volée pour éviter la complexité MONAI pure.
-            # Note: Dans ce script simplifié, il manque l'association directe Image <-> Label dans le loader MONAI.
-            # Je vais corriger ça dans la version suivante si ça plante, mais testons l'architecture d'abord.
-            pass 
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            
+        train_acc = 100 * correct / total
+        
+        # Validation
+        model.eval()
+        val_correct = 0
+        val_total = 0
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                _, predicted = torch.max(outputs.data, 1)
+                val_total += labels.size(0)
+                val_correct += (predicted == labels).sum().item()
+        
+        val_acc = 100 * val_correct / val_total
+        
+        print(f"Epoch [{epoch+1}/{EPOCHS}] "
+              f"Loss: {running_loss/len(train_loader):.4f} | "
+              f"Train Acc: {train_acc:.2f}% | "
+              f"Val Acc: {val_acc:.2f}%")
 
-    # --- STOP --- 
-    # Je réalise que le code ci-dessus pour les labels avec MONAI Dataset est un peu piégeux
-    # car MONAI gère les images, mais il faut lui passer les labels explicitement.
-    # Je vais te donner la version CORRIGÉE ci-dessous pour ne pas que tu perdes de temps.
+    torch.save(model.state_dict(), MODEL_SAVE_PATH)
+    print(f"\nModel saved to: {MODEL_SAVE_PATH}")
 
 if __name__ == "__main__":
-    pass
+    train()
